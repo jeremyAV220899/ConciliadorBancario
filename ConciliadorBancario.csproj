@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>ConciliadorBancario</AssemblyName>
+    <RootNamespace>ConciliadorBancario</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="INSTALAR_REQUISITOS_V32.ps1" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Always" />
+    <PackageReference Include="ClosedXML" Version="0.104.2" />
+    <PackageReference Include="PdfPig" Version="0.1.10" />
+    <PackageReference Include="PDFsharp" Version="6.2.2" />
+    <PackageReference Include="SharpCompress" Version="0.39.0" />
+  </ItemGroup>
+</Project>
