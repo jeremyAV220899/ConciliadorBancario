@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.IO.Compression;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -97,6 +97,7 @@ internal static class ProcessingEngine
                 var pageSizes = new Dictionary<int, (double Width, double Height)>();
                 int pageCount = 0, textTokenCount = 0, dniFound = 0, dniInExcel = 0, filesBefore = individualCount, reviewsBefore = reviews.Count;
                 Box? paymentDateFrame = null;
+                var scotiabankHeaders = new Dictionary<int, Box>();
                 var safeName = SafeFile(Path.GetFileName(path));
                 try
                 {
@@ -124,6 +125,13 @@ internal static class ProcessingEngine
                                     progress.Report(new(8 + (int)(84.0 * (i + 1) / Math.Max(1, jobs.Count)),
                                         $"AVISO: {bank} ({payment}): fecha de pago sin ubicación inequívoca, no se dibujará marca de fecha."));
                             }
+                            // Scotiabank: identificar empresa y fecha en la propia hoja del trabajador.
+                            // La cabecera puede repetirse en cada página; nunca se añade portada.
+                            if (bank == "SCOTIABANK")
+                            {
+                                var headerFrame = FindScotiabankCompanyDateFrame(tokens, page.Width, page.Height);
+                                if (headerFrame is not null) scotiabankHeaders[pageNo] = headerFrame;
+                            }
                             if (bank == "BBVA")
                             {
                                 pageTokens[pageNo] = tokens;
@@ -138,7 +146,8 @@ internal static class ProcessingEngine
                                 dniInExcel++;
                                 string recordKey = $"{path}|{pageNo}|{dni}|{Math.Round(occurrence.MidY, 1)}";
                                 if (!seenRecords.Add(recordKey)) continue;
-                                var frame = CalculateSafeFrame(tokens, occurrence, dniWords, bank, page.Width, page.Height, out var borderWidth, out var reason);
+                                var frame = CalculateSafeFrame(tokens, occurrence, dniWords, bank, page.Width, page.Height, out var borderWidth, out var reason,
+                                    candidates.Count == 1 ? candidates[0].Name : null);
                                 if (frame is null)
                                 {
                                     reviews.Add((dni, path, pageNo, reason));
@@ -185,12 +194,16 @@ internal static class ProcessingEngine
                     var destGeneral = UniquePath(Path.Combine(paymentGeneral, safeName));
                     try
                     {
-                        if (fileMatches.Count == 0) File.Copy(path, destGeneral);
-                        else WriteGeneral(path, destGeneral, fileMatches);
+                        // Conservar el PDF bancario completo. Marcar los mismos recuadros
+                        // seguros de los individuales y la fecha, sin dividir páginas.
+                        if (fileMatches.Count == 0 && paymentDateFrame is null && scotiabankHeaders.Count == 0)
+                            File.Copy(path, destGeneral);
+                        else
+                            WriteGeneral(path, destGeneral, fileMatches, paymentDateFrame, scotiabankHeaders);
                     }
                     catch (Exception ex)
                     {
-                        reviews.Add(("", path, 0, "No se pudo subrayar PDF general: " + ex.Message));
+                        reviews.Add(("", path, 0, "No se pudo enmarcar PDF general: " + ex.Message));
                         if (File.Exists(destGeneral)) File.Delete(destGeneral);
                         File.Copy(path, destGeneral);
                     }
@@ -203,7 +216,8 @@ internal static class ProcessingEngine
                             string bankFolder = Path.Combine(paymentIndividual, SafeFile(m.Bank));
                             Directory.CreateDirectory(bankFolder);
                             string output = UniquePath(Path.Combine(bankFolder, filename));
-                            WriteIndividual(path, output, m, paymentDateFrame);
+                            WriteIndividual(path, output, m, paymentDateFrame,
+                                 scotiabankHeaders.TryGetValue(m.Page, out var header) ? header : null);
                             // GENERAL contiene todos los comprobantes individuales del pago, sin cambiar el original.
                             string generalCopy = UniquePath(Path.Combine(paymentIndividual, "GENERAL", filename));
                             File.Copy(output, generalCopy);
@@ -304,16 +318,25 @@ internal static class ProcessingEngine
                 x.Row,
                 Dni = x.Cells.FirstOrDefault(c => c.Value is "dni" or "documento" or "numerodedocumento" or "numerodni" or "nrodocumento" or "docidentidad" or "identificacion").Key,
                 Name = x.Cells.FirstOrDefault(c => c.Value.Contains("nombre") || c.Value.Contains("apellidos") || c.Value == "trabajador" || c.Value == "beneficiario").Key,
-                Amount = x.Cells.FirstOrDefault(c => c.Value.Contains("monto") || c.Value.Contains("importe") || c.Value.Contains("netopagar") || c.Value == "pago").Key
+                Amount = x.Cells.FirstOrDefault(c => c.Value.Contains("monto") || c.Value.Contains("importe") || c.Value.Contains("netopagar") || c.Value == "pago").Key,
+                DocumentType = x.Cells.FirstOrDefault(c => c.Value is "tipodocumento" or "tipodedocumento" or "tipodoc" or "tipodocidentidad" or "tipodeidentificacion" or "tipodocumentoidentidad").Key
             }).FirstOrDefault(x => x.Dni > 0 && x.Name > 0);
             if (header is null) continue;
             foreach (var row in rows.Where(r => r.RowNumber() > header.Row.RowNumber()))
             {
                 var dniCell = row.Cell(header.Dni);
+                // DNI: 8 dígitos; CE/CEX: 9 dígitos. Mantener ceros iniciales.
+                // Cuando el Excel guarda CE como número, se recuperan los ceros
+                // únicamente si la columna de tipo identifica CE/CEX.
                 string dni = NumericRegex.Replace(dniCell.GetFormattedString(), "");
-                if (dni.Length < 8 && dni.Length > 0 && dniCell.TryGetValue<long>(out var numericDni) && numericDni >= 0)
-                    dni = numericDni.ToString("D8", CultureInfo.InvariantCulture);
-                if (dni.Length != 8) continue;
+                string documentType = header.DocumentType > 0
+                    ? NormalizeHeader(row.Cell(header.DocumentType).GetFormattedString()) : "";
+                bool isForeignCard = documentType is "ce" or "cex" or "carnetdeextranjeria"
+                    or "carnedeextranjeria" or "carnetextranjeria";
+                if (dni.Length > 0 && dni.Length < (isForeignCard ? 9 : 8) &&
+                    dniCell.TryGetValue<long>(out var numericDni) && numericDni >= 0)
+                    dni = numericDni.ToString(isForeignCard ? "D9" : "D8", CultureInfo.InvariantCulture);
+                if (dni.Length != 8 && dni.Length != 9) continue;
                 string name = row.Cell(header.Name).GetFormattedString().Trim();
                 if (string.IsNullOrEmpty(name)) name = "SIN_NOMBRE";
                 decimal? amount = null;
@@ -437,7 +460,7 @@ internal static class ProcessingEngine
     // V5: buscar límites a partir de los textos completos, no únicamente del centro del DNI.
     // Nunca se fuerza un marco cuya tinta pudiera tocar otra palabra.
     private static Box? CalculateSafeFrame(List<Token> tokens, Token dni, List<Token> anchors,
-        string bank, double pageWidth, double pageHeight, out double borderWidth, out string reason)
+        string bank, double pageWidth, double pageHeight, out double borderWidth, out string reason, string? expectedName = null)
     {
         reason = "";
         borderWidth = 1.35;
@@ -455,7 +478,7 @@ internal static class ProcessingEngine
         if (bank == "BBVA")
         {
             var bbvaFrame = CalculateBbvaFrame(tokens, dni, anchors, pageWidth, pageHeight,
-                out borderWidth, out reason);
+                out borderWidth, out reason, expectedName);
             if (bbvaFrame is not null) return bbvaFrame;
         }
         // V8: BCP imprime el mismo DNI en "Documento" y "Ref Emp".
@@ -548,6 +571,9 @@ internal static class ProcessingEngine
                     { safe = false; break; }
                 }
                 if (!safe) continue;
+                // BBVA: no incluir el número correlativo de otra fila en el recuadro.
+                // El resto de bancos conserva la validación existente.
+                if (bank == "BBVA" && BbvaFrameIncludesOtherRow(tokens, dni, frame, pageWidth)) continue;
                 borderWidth = stroke;
                 return frame;
             }
@@ -564,10 +590,24 @@ internal static class ProcessingEngine
     // contra TODOS los textos de la página y evita DNI de otras filas.
     private static Box? CalculateBbvaFrame(List<Token> tokens, Token dni,
         List<Token> anchors, double pageWidth, double pageHeight,
-        out double borderWidth, out string reason)
+        out double borderWidth, out string reason, string? expectedName)
     {
         borderWidth = 1.35;
         reason = "BBVA: no se pudo delimitar con seguridad la fila completa";
+        // Ruta BBVA específica: el nombre del Excel evita arrastrar una línea
+        // de la fila anterior o siguiente cuando el titular ocupa varias líneas.
+        // Si no hay evidencia suficiente, se mantiene el algoritmo V35 existente.
+        if (!string.IsNullOrWhiteSpace(expectedName))
+        {
+            var namedFrame = TryBbvaNameAnchoredFrame(tokens, dni, anchors, expectedName,
+                pageWidth, pageHeight, out var namedStroke);
+            if (namedFrame is not null)
+            {
+                borderWidth = namedStroke;
+                reason = "";
+                return namedFrame;
+            }
+        }
         var ordered = anchors.OrderBy(t => t.MidY).ToList();
         int i = ordered.FindIndex(t => ReferenceEquals(t, dni));
         if (i < 0) return null;
@@ -606,12 +646,108 @@ internal static class ProcessingEngine
             var content = Box.Union(row.Select(t => t.Bounds));
             if (content.Width < 250 || content.Height < 13 || content.Height > 105)
                 continue;
+            // Algunos PDF BBVA reparten los nombres en 3-5 líneas y la banda
+            // puede alcanzar el registro siguiente, aunque su DNI no esté visible.
+            // Su número correlativo es una segunda ancla independiente del DNI.
+            if (BbvaFrameIncludesOtherRow(tokens, dni, content, pageWidth)) continue;
             var candidate = TrySafeBorder(tokens, ordered, dni, content, bottom,
                 pageWidth, pageHeight, out borderWidth, out reason);
-            if (candidate is not null) return candidate;
+            if (candidate is not null && !BbvaFrameIncludesOtherRow(tokens, dni, candidate, pageWidth))
+                return candidate;
         }
         reason = "BBVA: fila multilínea sin borde seguro; revisar delimitación";
         return null;
+    }
+
+    // BBVA: segmentación adicional, exclusivamente para coincidencias con nombre
+    // verificado en el Excel. No altera el tratamiento de otros bancos ni las
+    // continuaciones entre páginas. No inventa texto: encierra la fila original.
+    private static Box? TryBbvaNameAnchoredFrame(List<Token> tokens, Token dni,
+        List<Token> anchors, string expectedName, double pageWidth, double pageHeight, out double borderWidth)
+    {
+        borderWidth = 1.35;
+        var expected = Regex.Matches(NormalizePerson(expectedName), @"[A-Z]{3,}")
+            .Select(m => m.Value).Distinct(StringComparer.Ordinal).ToList();
+        if (expected.Count < 2) return null;
+
+        // La cuenta está impresa cerca del comienzo del registro y precede al DNI
+        // normalmente 0-10 pt. Es una referencia más estable que el punto medio
+        // entre dos DNI en filas con nombres multilínea.
+        var accounts = tokens.Where(t =>
+                t.Bounds.Left >= pageWidth * 0.13 &&
+                t.Bounds.Left < pageWidth * 0.27 &&
+                Regex.IsMatch(t.Text.Trim(), @"^\d{4}-\d{4}-\d{2}-\d{7,10}$"))
+            .OrderBy(t => t.Bounds.Top).ToList();
+        var account = accounts.Where(t => t.Bounds.Top >= dni.Bounds.Top - 23 &&
+                t.Bounds.Top <= dni.Bounds.Bottom + 3)
+            .OrderBy(t => Math.Abs(t.MidY - dni.MidY + 7.5)).FirstOrDefault();
+        if (account is null) return null;
+        double start = Math.Max(0, account.Bounds.Top - 10.5);
+        double nextAccountTop = accounts.Where(t => t.Bounds.Top > account.Bounds.Top + 15)
+            .Select(t => t.Bounds.Top).DefaultIfEmpty(pageHeight).Min();
+        double limit = Math.Min(pageHeight - 1, nextAccountTop - 0.6);
+        if (limit <= dni.Bounds.Bottom) return null;
+
+        bool Related(Token t)
+        {
+            var normalized = NormalizePerson(t.Text).Trim();
+            if (!Regex.IsMatch(normalized, @"^[A-Z]{3,}$")) return false;
+            return expected.Any(part => part.Equals(normalized, StringComparison.Ordinal) ||
+                (part.Length >= 5 && normalized.Length >= 5 &&
+                 (part.StartsWith(normalized, StringComparison.Ordinal) ||
+                  normalized.StartsWith(part, StringComparison.Ordinal))));
+        }
+        var nameTokens = tokens.Where(t =>
+                t.Bounds.Left >= pageWidth * 0.37 &&
+                t.Bounds.Left < pageWidth * 0.65 &&
+                t.Bounds.Top >= start && t.Bounds.Top < limit &&
+                t.Bounds.Top < dni.Bounds.Bottom + 45 && Related(t)).ToList();
+        // Exigir al menos dos palabras diferentes concordantes; así no se ajusta
+        // el registro sobre un apellido compartido con otro trabajador.
+        if (nameTokens.Select(t => NormalizePerson(t.Text)).Distinct().Count() < 2)
+            return null;
+        double nameBottom = nameTokens.Max(t => t.Bounds.Bottom);
+        // El estado CORRECTO suele finalizar 7.5 puntos debajo del DNI.
+        var status = tokens.Where(t => t.Text.Equals("CORRECTO", StringComparison.OrdinalIgnoreCase) &&
+            t.Bounds.Left >= pageWidth * 0.80 && t.Bounds.Top >= account.Bounds.Top &&
+            t.Bounds.Top < Math.Min(limit, dni.Bounds.Bottom + 19))
+            .OrderBy(t => Math.Abs(t.MidY - dni.MidY)).FirstOrDefault();
+        var abono = tokens.Where(t => t.Text.Equals("ABONO", StringComparison.OrdinalIgnoreCase) &&
+            t.Bounds.Left >= pageWidth * 0.80 &&
+            Math.Abs(t.Bounds.Top - account.Bounds.Top) <= 4).FirstOrDefault();
+        if (status is null || abono is null) return null;
+
+        double maxBottom = Math.Min(limit, Math.Max(nameBottom,
+            Math.Max(status.Bounds.Bottom, dni.Bounds.Bottom)) + 0.25);
+        var row = tokens.Where(t =>
+            t.Bounds.Left >= pageWidth * 0.09 && t.Bounds.Right <= pageWidth * 0.955 &&
+            t.Bounds.Top >= start && t.Bounds.Bottom <= maxBottom).ToList();
+        if (!row.Contains(dni) || !row.Contains(account) || !row.Contains(status) ||
+            !row.Contains(abono) || FindBankAmount(row, "BBVA", pageWidth) is null ||
+            !nameTokens.All(row.Contains)) return null;
+        var content = Box.Union(row.Select(t => t.Bounds));
+        if (content.Width < 250 || content.Height < 13 || content.Height > 105 ||
+            BbvaFrameIncludesOtherRow(tokens, dni, content, pageWidth)) return null;
+        var frame = TrySafeBorder(tokens, anchors, dni, content, nextAccountTop,
+            pageWidth, pageHeight, out borderWidth, out _);
+        if (frame is null || BbvaFrameIncludesOtherRow(tokens, dni, frame, pageWidth))
+            return null;
+        return frame;
+    }
+
+    // Salvaguarda exclusiva BBVA: una fila puede invadir el registro vecino
+    // cuando su titular se imprime en varias líneas. Si el recuadro incluye
+    // otro número correlativo (columna «No.»), no se considera seguro.
+    // No afecta los nombres multilínea de la propia fila ni los otros bancos.
+    private static bool BbvaFrameIncludesOtherRow(List<Token> tokens, Token dni,
+        Box frame, double pageWidth)
+    {
+        return tokens.Any(t =>
+            t.Bounds.Left >= pageWidth * 0.11 &&
+            t.Bounds.Left <= pageWidth * 0.16 &&
+            Regex.IsMatch(t.Text.Trim(), @"^\d{1,4}$") &&
+            Math.Abs(t.MidY - dni.MidY) > 6 &&
+            t.Bounds.Overlaps(frame));
     }
 
     // V8: BCP Telecrédito. El número del registro, en la primera columna,
@@ -1065,44 +1201,118 @@ internal static class ProcessingEngine
         return null;
     }
 
-    private static void WriteGeneral(string source, string target, List<Match> matches)
+    // Scotiabank: encerrar en una sola caja el nombre de la empresa y su fecha
+    // de operación, sin copiar la primera hoja ni superponer el recuadro a la tabla.
+    // La posición se obtiene de los textos reales del encabezado de CADA página.
+    private static Box? FindScotiabankCompanyDateFrame(List<Token> tokens, double width, double height)
     {
-        using var doc = PdfReader.Open(source, PdfDocumentOpenMode.Modify);
-        foreach (var pageGroup in matches.GroupBy(m => m.Page))
+        var header = tokens.Where(t => t.Bounds.Left >= width * 0.56 &&
+            t.Bounds.Top >= 0 && t.Bounds.Bottom < height * 0.35).ToList();
+        if (header.Count == 0) return null;
+
+        // Admitir fecha convencional y fecha con hora en un token contiguo.
+        var dates = header.Where(t => Regex.IsMatch(t.Text.Trim(),
+            @"(?<!\d)\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}(?!\d)"))
+            .OrderBy(t => t.Bounds.Top).ToList();
+        foreach (var date in dates)
         {
-            var page = doc.Pages[pageGroup.Key - 1];
-            using var graphics = XGraphics.FromPdfPage(page, XGraphicsPdfPageOptions.Append);
-            foreach (var m in pageGroup)
-            {
-                Underline(graphics, m.DniBox);
-                if (m.AmountBox is not null) Underline(graphics, m.AmountBox);
-            }
+            // En las órdenes Scotiabank la empresa figura justo encima de la fecha.
+            // Rechazar candidatos que no tengan texto empresarial en dicha posición.
+            var companyLine = header.Where(t => t.Text.Any(char.IsLetter) &&
+                t.Bounds.Bottom <= date.Bounds.Top + 1 &&
+                date.Bounds.Top - t.Bounds.Bottom <= 33 &&
+                Math.Abs(t.Bounds.Left - date.Bounds.Left) <= width * 0.30).ToList();
+            if (companyLine.Count == 0) continue;
+            double lineBottom = companyLine.Max(t => t.Bounds.Bottom);
+            var companyWords = header.Where(t => t.Text.Any(char.IsLetter) &&
+                Math.Abs(t.Bounds.Bottom - lineBottom) <= 5 &&
+                t.Bounds.Left >= width * 0.56 && t.Bounds.Left < width * 0.97).ToList();
+            if (companyWords.Count == 0) continue;
+            double top = companyWords.Min(t => t.Bounds.Top);
+            if (date.Bounds.Top - top > 40) continue;
+            var contents = header.Where(t =>
+                t.Bounds.Top >= top - 1.5 && t.Bounds.Bottom <= date.Bounds.Bottom + 2 &&
+                t.Bounds.Left >= Math.Min(companyWords.Min(w => w.Bounds.Left), date.Bounds.Left) - 2 &&
+                t.Bounds.Right <= width * 0.985).ToList();
+            if (!contents.Contains(date)) contents.Add(date);
+            if (contents.Count < 2) continue;
+            var area = Box.Union(contents.Select(t => t.Bounds));
+            const double margin = 3.0;
+            var box = new Box(Math.Max(1, area.Left - margin), Math.Max(1, area.Top - margin),
+                Math.Min(width - 1, area.Right + margin), Math.Min(height - 1, area.Bottom + margin));
+            // No encerrar inadvertidamente columnas de la tabla ni texto distante.
+            if (box.Width > width * 0.43 || box.Height > 54) continue;
+            return box;
         }
-        doc.Save(target);
+        return null;
     }
 
-    private static void Underline(XGraphics gfx, Box box)
+    // PDF general: conservar todas las páginas y documentos en su orden original.
+    // Los cuadros se toman de las MISMAS posiciones ya validadas para cada
+    // comprobante individual; no se vuelve a calcular ni a buscar DNI.
+    private static void WriteGeneral(string source, string target, List<Match> matches,
+        Box? paymentDateFrame, IReadOnlyDictionary<int, Box> scotiabankHeaders)
     {
-        var y = box.Bottom + 1.3;
-        // V7: los PDF de Interbank pueden terminar el contenido original con
-        // el color de trazo BLANCO. PDFsharp puede omitir un "0 0 0 RG"
-        // si cree que negro es el color inicial. Forzar primero la transición
-        // de color (sin trazo visible), y luego pedir negro explícitamente.
-        ForceBlackStroke(gfx, box.Left, y);
-        gfx.DrawLine(new XPen(XColors.Black, 1.15), box.Left, y, box.Right, y);
+        using var doc = PdfReader.Open(source, PdfDocumentOpenMode.Modify);
+        var framesByPage = new Dictionary<int, List<PageFrame>>();
+        foreach (var m in matches)
+        {
+            AddFrame(new PageFrame(m.Page, m.Frame, m.BorderWidth));
+            foreach (var continuation in m.Continuations)
+                AddFrame(continuation);
+        }
+
+        // Otros bancos: la fecha de operación se muestra en su primera página.
+        // Scotiabank: cabecera de empresa y fecha en cada hoja en que aparece,
+        // conservando la excepción de una sola página en los individuales.
+        var headerPages = scotiabankHeaders.Keys.ToHashSet();
+        if (paymentDateFrame is not null && scotiabankHeaders.Count == 0)
+            headerPages.Add(1);
+        var pagesToMark = framesByPage.Keys.Concat(headerPages).Distinct().OrderBy(n => n);
+        foreach (int pageNumber in pagesToMark)
+        {
+            if (pageNumber < 1 || pageNumber > doc.PageCount) continue;
+            var page = doc.Pages[pageNumber - 1];
+            using var gfx = XGraphics.FromPdfPage(page, XGraphicsPdfPageOptions.Append);
+
+            if (scotiabankHeaders.TryGetValue(pageNumber, out var header))
+                DrawGeneralFrame(gfx, header, 1.25);
+            else if (pageNumber == 1 && scotiabankHeaders.Count == 0 && paymentDateFrame is not null)
+                DrawGeneralFrame(gfx, paymentDateFrame, 1.25);
+
+            if (!framesByPage.TryGetValue(pageNumber, out var frames)) continue;
+            foreach (var frame in frames)
+                DrawGeneralFrame(gfx, frame.Frame, frame.BorderWidth);
+        }
+        doc.Save(target);
+
+        void AddFrame(PageFrame frame)
+        {
+            if (!framesByPage.TryGetValue(frame.Page, out var list))
+                framesByPage[frame.Page] = list = new List<PageFrame>();
+            if (!list.Any(x => Math.Abs(x.Frame.Left - frame.Frame.Left) < 0.1 &&
+                               Math.Abs(x.Frame.Top - frame.Frame.Top) < 0.1 &&
+                               Math.Abs(x.Frame.Right - frame.Frame.Right) < 0.1 &&
+                               Math.Abs(x.Frame.Bottom - frame.Frame.Bottom) < 0.1))
+                list.Add(frame);
+        }
+    }
+
+    private static void DrawGeneralFrame(XGraphics gfx, Box frame, double strokeWidth)
+    {
+        ForceBlackStroke(gfx, frame.Left, frame.Top);
+        gfx.DrawRectangle(new XPen(XColors.Black, strokeWidth),
+            frame.Left, frame.Top, frame.Width, frame.Height);
     }
 
     private static void ForceBlackStroke(XGraphics gfx, double x, double y)
     {
-        // Un segmento prácticamente invisible con color blanco fuerza el cambio
-        // interno de estado del lápiz. El siguiente lápiz negro debe emitir
-        // explícitamente el comando "0 0 0 RG", incluso si el contenido
-        // importado terminó con "1 1 1 RG" (trazo blanco).
-        // Esta marca no dibuja un segmento visible ni altera el contenido.
+        // Los PDF de Interbank pueden terminar con el color de trazo BLANCO.
+        // Forzar la transición antes de dibujar el cuadro negro.
         gfx.DrawLine(new XPen(XColors.White, 0.1), x, y, x + 0.05, y);
     }
 
-    private static void WriteIndividual(string source, string target, Match m, Box? paymentDateFrame)
+    private static void WriteIndividual(string source, string target, Match m, Box? paymentDateFrame, Box? scotiabankHeaderFrame)
     {
         using var input = PdfReader.Open(source, PdfDocumentOpenMode.Import);
         using var doc = new PdfSharp.Pdf.PdfDocument();
@@ -1130,6 +1340,15 @@ internal static class ProcessingEngine
             dateGraphics.DrawRectangle(new XPen(XColors.Black, 1.25),
                 paymentDateFrame.Left, paymentDateFrame.Top,
                 paymentDateFrame.Width, paymentDateFrame.Height);
+        }
+        if (isScotiabank && scotiabankHeaderFrame is not null)
+        {
+            var bankPage = doc.Pages[position[m.Page]];
+            using var headerGraphics = XGraphics.FromPdfPage(bankPage, XGraphicsPdfPageOptions.Append);
+            ForceBlackStroke(headerGraphics, scotiabankHeaderFrame.Left, scotiabankHeaderFrame.Top);
+            headerGraphics.DrawRectangle(new XPen(XColors.Black, 1.25),
+                scotiabankHeaderFrame.Left, scotiabankHeaderFrame.Top,
+                scotiabankHeaderFrame.Width, scotiabankHeaderFrame.Height);
         }
         var frames = new List<PageFrame> { new(m.Page, m.Frame, m.BorderWidth) };
         frames.AddRange(m.Continuations);

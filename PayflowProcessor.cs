@@ -100,24 +100,23 @@ internal static class PayflowProcessor
 
     private static void GeneratePdf(string destination, IReadOnlyList<Record> records, int highlightedIndex)
     {
-        // A3 horizontal (en puntos PDF). Nunca exceder el límite de altura de PDFsharp.
-        // Si el resumen no cabe, crear automáticamente páginas adicionales, sin perder filas.
-        const double width = 1190, pageHeight = 842, margin = 30, top = 108;
-        const double headerHeight = 38, rowHeight = 22, bottomMargin = 42;
+        // A3 vertical: se conserva la identidad de PAYFLOW y las seis columnas.
+        // Los valores extensos se distribuyen en varias líneas, sin puntos suspensivos.
+        const double width = 842, pageHeight = 1190, margin = 27, top = 106;
+        const double headerHeight = 40, rowHeight = 39, bottomMargin = 42;
         int rowsPerPage = Math.Max(1, (int)Math.Floor((pageHeight - top - headerHeight - bottomMargin) / rowHeight));
         int pageCount = (records.Count + rowsPerPage - 1) / rowsPerPage;
         using var doc = new PdfDocument();
-        var titleFont = new XFont("Arial", 31, XFontStyleEx.Bold);
-        var headerFont = new XFont("Arial", 11, XFontStyleEx.Regular);
-        var valueFont = new XFont("Arial", 10.4, XFontStyleEx.Regular);
-        var strongFont = new XFont("Arial", 10.5, XFontStyleEx.Bold);
+        var titleFont = new XFont("Arial", 30, XFontStyleEx.Bold);
+        var headerFont = new XFont("Arial", 8.5, XFontStyleEx.Bold);
+        var valueFont = new XFont("Arial", 8.4, XFontStyleEx.Regular);
+        var strongFont = new XFont("Arial", 8.4, XFontStyleEx.Bold);
         var footerFont = new XFont("Arial", 9, XFontStyleEx.Regular);
         string[] headers = { "Nombre", "Apellidos", "DNI o CE", "Nombre empresa", "RUC empresa", "Importe total a deducir S/." };
-        double[] widths = { 192, 215, 138, 275, 140, 170 };
+        // El ancho acumulado es 788pt; quedan 27pt de margen a cada lado.
+        double[] widths = { 132, 149, 96, 190, 97, 124 };
         double tableLeft = margin;
 
-        // En el PDF general: todas las paginas.
-        // En el PDF individual: exclusivamente la pagina original donde cae el trabajador.
         int firstPage = highlightedIndex < 0 ? 0 : highlightedIndex / rowsPerPage;
         int lastPageExclusive = highlightedIndex < 0 ? pageCount : firstPage + 1;
         for (int pageIndex = firstPage; pageIndex < lastPageExclusive; pageIndex++)
@@ -135,8 +134,8 @@ internal static class PayflowProcessor
             double x = tableLeft;
             for (int col = 0; col < headers.Length; col++)
             {
-                gfx.DrawString(headers[col], headerFont, XBrushes.White,
-                    new XRect(x + 4, y + 4, widths[col] - 8, headerHeight - 8), XStringFormats.CenterLeft);
+                DrawCell(gfx, headers[col], headerFont, XBrushes.White,
+                    new XRect(x + 4, y + 2, widths[col] - 8, headerHeight - 4), false, true);
                 x += widths[col];
             }
             y += headerHeight;
@@ -150,10 +149,9 @@ internal static class PayflowProcessor
                     r.Amount.ToString("N2", CultureInfo.InvariantCulture) };
                 for (int col = 0; col < values.Length; col++)
                 {
-                    var rect = new XRect(x + 4, y + 1, widths[col] - 8, rowHeight - 2);
-                    string cellText = Fit(gfx, values[col], col == 3 ? strongFont : valueFont, rect.Width);
-                    gfx.DrawString(cellText, col == 3 ? strongFont : valueFont, XBrushes.Black, rect,
-                        col == 5 ? XStringFormats.CenterRight : XStringFormats.CenterLeft);
+                    var rect = new XRect(x + 4, y + 2, widths[col] - 8, rowHeight - 4);
+                    DrawCell(gfx, values[col], col == 3 ? strongFont : valueFont,
+                        XBrushes.Black, rect, col == 5, col == 3);
                     x += widths[col];
                 }
                 gfx.DrawLine(new XPen(XColors.LightGray, 0.5), tableLeft,
@@ -169,13 +167,59 @@ internal static class PayflowProcessor
         doc.Save(destination);
     }
 
-    private static string Fit(XGraphics gfx, string input, XFont font, double width)
+    // Ajustar visualmente, pero nunca eliminar caracteres de nombres o empresas.
+    // Si un campo es excepcionalmente largo se reduce hasta el mínimo legible
+    // y se distribuye en todas las líneas disponibles de la celda.
+    private static void DrawCell(XGraphics gfx, string value, XFont preferred,
+        XBrush brush, XRect rect, bool rightAligned, bool bold)
     {
-        if (gfx.MeasureString(input, font).Width <= width) return input;
-        const string ending = "…";
-        int end = input.Length;
-        while (end > 0 && gfx.MeasureString(input[..end] + ending, font).Width > width) end--;
-        return input[..end] + ending;
+        string text = value?.Trim() ?? "";
+        XFont font = preferred;
+        List<string> lines = new();
+        for (double size = preferred.Size; size >= 5.0; size -= 0.4)
+        {
+            font = new XFont("Arial", size,
+                bold ? XFontStyleEx.Bold : XFontStyleEx.Regular);
+            lines = Wrap(gfx, text, font, rect.Width);
+            if (lines.Count * (size * 1.20) <= rect.Height) break;
+        }
+        // Para textos extremadamente extensos no truncar: la tabla aumenta
+        // su densidad tipográfica en vez de descartar palabras.
+        double lineHeight = Math.Min(font.Size * 1.20, rect.Height / Math.Max(1, lines.Count));
+        double y = rect.Y + (rect.Height - lines.Count * lineHeight) / 2;
+        foreach (string line in lines)
+        {
+            gfx.DrawString(line, font, brush,
+                new XRect(rect.X, y, rect.Width, lineHeight),
+                rightAligned ? XStringFormats.CenterRight : XStringFormats.CenterLeft);
+            y += lineHeight;
+        }
+    }
+
+    private static List<string> Wrap(XGraphics gfx, string value, XFont font, double width)
+    {
+        var result = new List<string>();
+        if (string.IsNullOrEmpty(value)) { result.Add(""); return result; }
+        string current = "";
+        foreach (string word in value.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+        {
+            string candidate = current.Length == 0 ? word : current + " " + word;
+            if (gfx.MeasureString(candidate, font).Width <= width)
+            {
+                current = candidate;
+                continue;
+            }
+            if (current.Length > 0) { result.Add(current); current = ""; }
+            // También se permite un DNI/razón social sin espacios.
+            foreach (char c in word)
+            {
+                if (current.Length > 0 && gfx.MeasureString(current + c, font).Width > width)
+                { result.Add(current); current = ""; }
+                current += c;
+            }
+        }
+        if (current.Length > 0) result.Add(current);
+        return result;
     }
 
     private static string Normalize(string s) => new string(s.Normalize(NormalizationForm.FormD)

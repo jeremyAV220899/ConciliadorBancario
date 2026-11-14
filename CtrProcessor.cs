@@ -22,7 +22,7 @@ internal static class CtrProcessor
         if (!Path.GetExtension(inputPath).Equals(".pdf", StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException($"{displayName} debe ser un archivo PDF.");
 
-        var wanted = workers.Select(w => w.Dni).Where(d => Regex.IsMatch(d, @"^\d{8}$"))
+        var wanted = workers.Select(w => w.Dni).Where(d => Regex.IsMatch(d, @"^\d{8,9}$"))
             .ToHashSet(StringComparer.Ordinal);
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var marks = new Dictionary<int, List<(double Top, double Bottom, string Dni)>>();
@@ -38,7 +38,7 @@ internal static class CtrProcessor
                 foreach (var word in words)
                 {
                     string dni = word.Text.Trim();
-                    if (!Regex.IsMatch(dni, @"^\d{8}$") || !wanted.Contains(dni)) continue;
+                    if (!Regex.IsMatch(dni, @"^\d{8,9}$") || !wanted.Contains(dni)) continue;
                     // En constancias Mapfre la columna documento se encuentra
                     // a la izquierda del nombre; evita marcar DNI en pies o cabeceras.
                     var b = word.BoundingBox;
