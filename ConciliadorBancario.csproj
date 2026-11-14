@@ -7,6 +7,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>ConciliadorBancario</AssemblyName>
+    <Version>35.1.0</Version>
+    <AssemblyVersion>35.1.0.0</AssemblyVersion>
+    <FileVersion>35.1.0.0</FileVersion>
     <RootNamespace>ConciliadorBancario</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
