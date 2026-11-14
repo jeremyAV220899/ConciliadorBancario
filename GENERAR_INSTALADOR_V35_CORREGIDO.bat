@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%~dp0"
 set "ROOT=%CD%"
@@ -9,6 +9,8 @@ set "OUT=%ROOT%\Publicacion_Instalador"
 set "SETUPDIR=%ROOT%\Instalador"
 set "ISS=%SETUPDIR%\ConciliadorBancario_V35_auto.iss"
 set "ISCC="
+set "APPVERSION="
+set "SETUPEXE=%SETUPDIR%\Salida\Setup_Conciliador_Bancario_V35.exe"
 
 echo ==========================================================
 echo   CONCILIADOR BANCARIO V35 - GENERADOR DE INSTALADOR
@@ -51,6 +53,13 @@ if not defined ISCC goto :manual_inno
 echo.
 echo Se usara: "%ISCC%"
 echo.
+rem La version publicada debe coincidir con la version del ejecutable.
+for /f "usebackq delims=" %%V in (`powershell -NoProfile -Command "$p=[xml](Get-Content -LiteralPath '%PROJECT%'); $p.Project.PropertyGroup.Version | Select-Object -First 1"`) do set "APPVERSION=%%V"
+if not defined APPVERSION (
+  echo ERROR: Falta Version en el .csproj. No se publicara un instalador sin version.
+  goto :error
+)
+echo Version detectada: %APPVERSION%
 echo [1/3] Publicando el Conciliador para Windows x64...
 dotnet publish "%PROJECT%" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishTrimmed=false -p:PublishReadyToRun=false -o "%OUT%"
 if errorlevel 1 (
@@ -71,7 +80,7 @@ if not exist "%SETUPDIR%" (
 
 echo [2/3] Preparando el archivo de instalacion...
 > "%ISS%" echo #define MyAppName "Conciliador Bancario"
->> "%ISS%" echo #define MyAppVersion "35.0.0"
+>> "%ISS%" echo #define MyAppVersion "%APPVERSION%"
 >> "%ISS%" echo #define MyAppExeName "ConciliadorBancario.exe"
 >> "%ISS%" echo.
 >> "%ISS%" echo [Setup]
@@ -112,10 +121,24 @@ if errorlevel 1 (
   echo ERROR: Inno Setup no pudo compilar el instalador. Revisa el mensaje superior.
   goto :error
 )
-if not exist "%SETUPDIR%\Salida\Setup_Conciliador_Bancario_V35.exe" (
+if not exist "%SETUPEXE%" (
   echo ERROR: No se encuentra Setup_Conciliador_Bancario_V35.exe.
   goto :error
 )
+echo.
+echo [4/4] Generando SHA256 del instalador para GitHub Releases...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$hash=(Get-FileHash -LiteralPath '%SETUPEXE%' -Algorithm SHA256).Hash.ToLowerInvariant(); [System.IO.File]::WriteAllText('%SETUPEXE%.sha256', $hash + '  Setup_Conciliador_Bancario_V35.exe' + [Environment]::NewLine, [System.Text.Encoding]::ASCII)"
+if errorlevel 1 (
+  echo ERROR: No se pudo generar el archivo SHA256. No publiques esta version.
+  goto :error
+)
+if not exist "%SETUPEXE%.sha256" (
+  echo ERROR: No existe el archivo .sha256 que requiere el actualizador.
+  goto :error
+)
+echo Publique DOS archivos en GitHub Releases con tag v%APPVERSION%:
+echo   Setup_Conciliador_Bancario_V35.exe
+echo   Setup_Conciliador_Bancario_V35.exe.sha256
 echo.
 echo ==========================================================
 echo   INSTALADOR GENERADO CORRECTAMENTE

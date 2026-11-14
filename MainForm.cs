@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Drawing;
 using System.IO.Compression;
 using System.Security.Cryptography;
@@ -48,6 +48,7 @@ public sealed class MainForm : Form
     private readonly Button _cancelButton = new();
     private readonly Button _requirementsButton = new();
     private readonly Button _orderButton = new();
+    private readonly Button _updateButton = new();
     private IReadOnlyList<string> _documentOrder = DocumentOrderSettings.Load();
     private readonly ProgressBar _progress = new();
 
@@ -93,9 +94,11 @@ public sealed class MainForm : Form
 
         var header = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2,
+            Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2,
             BackColor = Navy, Padding = new Padding(24, 15, 16, 12)
         };
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 184));
         header.RowStyles.Add(new RowStyle(SizeType.Absolute, 39));
         header.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         header.Controls.Add(new Label
@@ -111,6 +114,22 @@ public sealed class MainForm : Form
             Font = new Font("Segoe UI", 9F), AutoEllipsis = true,
             TextAlign = ContentAlignment.MiddleLeft
         }, 0, 1);
+        header.SetColumnSpan(header.GetControlFromPosition(0, 1)!, 2);
+        StyleButton(_updateButton, "Buscar actualizaciones", false);
+        _updateButton.Dock = DockStyle.Fill;
+        _updateButton.Margin = new Padding(5, 0, 0, 4);
+        _updateButton.Click += (_, _) =>
+        {
+            if (_cts is not null)
+            {
+                MessageBox.Show(this, "Finalice o cancele la conciliación antes de actualizar.",
+                    "Conciliador bancario", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            using var updateWindow = new UpdateForm();
+            updateWindow.ShowDialog(this);
+        };
+        header.Controls.Add(_updateButton, 1, 0);
         root.Controls.Add(header, 0, 0);
 
         // Datos obligatorios visibles en todo momento: nunca ocultos por el scroll.
@@ -511,6 +530,7 @@ public sealed class MainForm : Form
         _runButton.Enabled = !running && ready > 0 && invalid == 0 && requiredReady;
         _cancelButton.Enabled = running;
         _orderButton.Enabled = !running;
+        _updateButton.Enabled = !running;
         _status.Text = running ? "Generando conciliación…" : _runButton.Enabled ? "✓ Preparado para generar" :
             invalid > 0 ? "⚠ Revisar rutas" : !requiredReady ? "⚠ Falta destino o Excel (excepto BOLETAS)" : "⚠ Seleccione un documento";
     }
